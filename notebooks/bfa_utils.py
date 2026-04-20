@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -465,4 +466,83 @@ def measure_kv_flipped_loss(
             if torch.isfinite(flipped.float()) else float("nan"),
         "post_loss": float(loss),
         "post_loss_finite": finite,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Rollout + metrics helpers (shared by demo notebooks)
+# --------------------------------------------------------------------------- #
+#
+# Thin wrappers around `sample_trajectories_from_data_with_vlm_rollout` and
+# ADE/FDE, factored out so the single-flip CoT/trajectory demo notebook stays
+# short. Seeding convention matches inference_cam_num.ipynb: seed on CUDA
+# before every rollout so sampling noise is identical across conditions.
+
+
+def run_rollout(
+    model,
+    model_inputs: Dict[str, Any],
+    seed: int = 42,
+    **roll_kwargs: Any,
+) -> Dict[str, Any]:
+    """Seeded VLM + expert rollout. Returns {pred_xyz (cpu), pred_rot (cpu), cot}.
+
+    `roll_kwargs` are forwarded to
+    `model.sample_trajectories_from_data_with_vlm_rollout` — typically
+    `top_p`, `temperature`, `num_traj_samples`, `max_generation_length`.
+    `return_extra=True` is always set so CoT text is captured.
+
+    The CUDA seed is set inside this function so back-to-back calls are
+    independent of caller-side RNG state. bfloat16 autocast is used to
+    match the release model's inference dtype.
+    """
+    torch.cuda.manual_seed_all(seed)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
+            data=model_inputs,
+            return_extra=True,
+            **roll_kwargs,
+        )
+    if extra is not None and "cot" in extra:
+        arr = np.asarray(extra["cot"])
+        cot = str(arr.reshape(-1)[0]) if arr.size > 0 else ""
+    else:
+        cot = ""
+    return {
+        "pred_xyz": pred_xyz.detach().cpu(),
+        "pred_rot": pred_rot.detach().cpu() if pred_rot is not None else None,
+        "cot": cot,
+    }
+
+
+def compute_traj_metrics(
+    pred_xy_all: np.ndarray,
+    gt_xy: np.ndarray,
+) -> Dict[str, float]:
+    """Standard minADE / meanADE / minFDE / meanFDE from (K, T, 2) predictions
+    against a (T, 2) ground-truth path.
+
+    Samples containing any NaN waypoint are filtered before computing the
+    metrics — a catastrophic-bit flip can push some rollout samples into
+    non-finite territory while leaving others intact. `n_finite` reports
+    how many usable samples remained.
+    """
+    mask = ~np.isnan(pred_xy_all.reshape(pred_xy_all.shape[0], -1)).any(axis=1)
+    pred_xy = pred_xy_all[mask]
+    if pred_xy.size == 0:
+        return {
+            "n_finite": 0,
+            "minADE_m": float("nan"),
+            "meanADE_m": float("nan"),
+            "minFDE_m": float("nan"),
+            "meanFDE_m": float("nan"),
+        }
+    ade = np.linalg.norm(pred_xy - gt_xy[None, ...], axis=-1).mean(axis=-1)
+    fde = np.linalg.norm(pred_xy[:, -1, :] - gt_xy[-1, :][None, :], axis=-1)
+    return {
+        "n_finite": int(pred_xy.shape[0]),
+        "minADE_m": float(ade.min()),
+        "meanADE_m": float(ade.mean()),
+        "minFDE_m": float(fde.min()),
+        "meanFDE_m": float(fde.mean()),
     }
