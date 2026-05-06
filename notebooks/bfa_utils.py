@@ -734,6 +734,16 @@ def compute_clean_grads_vlm(
     with torch.autocast(dev.type, dtype=torch.bfloat16):
         ctx_grad = build_fm_context_with_grad(model, model_inputs, gt_action)
         loss = fm_one_step_loss(model, ctx_grad, t_val=t_val, noise=noise)
+    # Reset the prompt cache to length 0 before backward so per-layer
+    # checkpoint recomputation sees an empty cache (matching the state the
+    # checkpointed VLM forward originally saw). Without this, each layer's
+    # `past_key_values.update()` does cat([cached_prefix, new_K]) on recompute
+    # but cat([empty, new_K]) on the original forward — different shapes flow
+    # into attention_interface, autograd's saved-tensor signature diverges,
+    # and use_reentrant=False raises CheckpointError. The autograd-saved K/V
+    # tensors that the action expert read are kept alive by the engine itself;
+    # crop(0) only drops the cache's external Python references.
+    ctx_grad.prompt_cache.crop(0)
     loss.backward()
 
     grads: Dict[str, torch.Tensor] = {}
