@@ -8,14 +8,17 @@ Target dtype: BF16 (16-bit: 1 sign + 8 exponent + 7 mantissa).
 
 from __future__ import annotations
 
+import contextlib
 import copy
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as _torch_ckpt
 
 
 def bf16_xor_bit_all(weight: torch.Tensor, bit: int) -> torch.Tensor:
@@ -546,3 +549,312 @@ def compute_traj_metrics(
         "minFDE_m": float(fde.min()),
         "meanFDE_m": float(fde.mean()),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3: VLM-target weight BFA + ADE cascade
+# --------------------------------------------------------------------------- #
+#
+# Two ranking variants:
+#   (3a) gradient-guided — needs backward through the 8B VLM. We run a single
+#        VLM backward under activation checkpointing so peak memory stays
+#        under ~80 GB on a 96 GB H20. After the clean-grads snapshot the
+#        with-grad context is dropped and the bit-flip loop reuses the
+#        cheap no-grad FMContext, restoring weights between trials so the
+#        cached K/V never goes stale.
+#   (3b) random + re-prefill — no gradients. Each trial flips, REBUILDS the
+#        FMContext (so the cached K/V reflects the flipped weight), measures,
+#        then restores. ~22× slower per trial than (3a), so the demo
+#        subsamples modules + coords.
+#
+# Plus a cross-cutting cascade that replays the top-N FM-loss flips through
+# full-trajectory rollout to get ADE/FDE — the actual safety metric that
+# fm_one_step_loss only proxies.
+
+
+def collect_target_linears_vlm(
+    model: nn.Module,
+    include_prefixes: Tuple[str, ...] = ("vlm.model.layers.",),
+) -> Dict[str, nn.Linear]:
+    """Linear collector restricted to the VLM text decoder by default.
+
+    Skips ``vlm.model.visual.*`` (image encoder) and ``vlm.lm_head`` —
+    those don't flow into action regression through the cached K/V.
+    Pass a wider tuple to include them. ~36 layers × 7 linears ≈ 250
+    modules for Qwen3-VL-8B.
+    """
+    out: Dict[str, nn.Linear] = {}
+    for name, mod in model.named_modules():
+        if not isinstance(mod, nn.Linear):
+            continue
+        if any(name.startswith(p) or name == p.rstrip(".") for p in include_prefixes):
+            out[name] = mod
+    return out
+
+
+@contextlib.contextmanager
+def _checkpoint_vlm_layers(model):
+    """Wrap each ``model.vlm.model.layers[i].forward`` in
+    ``torch.utils.checkpoint.checkpoint`` for the duration of the with-block.
+
+    We monkey-patch the bound method on each layer instance instead of using
+    HF's ``gradient_checkpointing_enable()`` because the latter is gated on
+    ``self.training`` in some transformers versions, and we are in eval mode.
+    Restored on exit even if the block raises.
+    """
+    layers = model.vlm.model.layers
+    originals: List[Callable] = []
+    for layer in layers:
+        orig = layer.forward
+        originals.append(orig)
+
+        def make(o):
+            def wrapper(*args, **kwargs):
+                return _torch_ckpt.checkpoint(o, *args, use_reentrant=False, **kwargs)
+            return wrapper
+
+        layer.forward = make(orig)
+    try:
+        yield
+    finally:
+        for layer, orig in zip(layers, originals):
+            layer.forward = orig
+
+
+def build_fm_context_with_grad(
+    model,
+    model_inputs: Dict,
+    gt_action: torch.Tensor,
+    use_checkpoint: bool = True,
+) -> FMContext:
+    """Like ``build_fm_context`` (no-grad version) but lets gradients flow
+    back to VLM weights. Used once at the start of Phase 3a to compute
+    ``∂loss/∂vlm_weights``; afterwards the cheap no-grad context is rebuilt
+    and reused for the per-trial measurement loop.
+
+    With ``use_checkpoint=True``, every VLM transformer layer is wrapped in
+    ``torch.utils.checkpoint`` so peak activation memory stays under ~40 GB
+    even at S≈2000 prefix tokens. Without it the backward can OOM on a
+    busy 96 GB H20.
+    """
+    tokenized = model_inputs["tokenized_data"]
+    input_ids = tokenized["input_ids"]
+    input_ids = model.fuse_traj_tokens(
+        input_ids,
+        {
+            "ego_history_xyz": model_inputs["ego_history_xyz"],
+            "ego_history_rot": model_inputs["ego_history_rot"],
+        },
+    )
+    device = input_ids.device
+
+    ckpt_ctx = _checkpoint_vlm_layers(model) if use_checkpoint else contextlib.nullcontext()
+    with ckpt_ctx:
+        vlm_out = model.vlm(
+            input_ids=input_ids,
+            attention_mask=tokenized.get("attention_mask"),
+            image_grid_thw=tokenized.get("image_grid_thw"),
+            pixel_values=tokenized.get("pixel_values"),
+            use_cache=True,
+            logits_to_keep=1,
+        )
+    prompt_cache = vlm_out.past_key_values
+    prefill_seq_len = prompt_cache.get_seq_length()
+    rope_deltas = model.vlm.model.rope_deltas
+
+    b_star = input_ids.shape[0]
+    n_diff = model.action_space.get_action_space_dims()[0]
+
+    offset = torch.full((b_star,), prefill_seq_len, device=device, dtype=torch.long)
+    prefix_mask = tokenized.get("attention_mask")
+    position_ids, attention_mask = model._build_expert_pos_ids_and_attn_mask(
+        offset=offset,
+        rope_deltas=rope_deltas,
+        kv_cache_seq_len=prefill_seq_len,
+        n_diffusion_tokens=n_diff,
+        b_star=b_star,
+        device=device,
+        prefix_mask=prefix_mask,
+    )
+    return FMContext(
+        prompt_cache=prompt_cache,
+        prefill_seq_len=prefill_seq_len,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        gt_action=gt_action.to(device=device).to(torch.bfloat16),
+        n_diffusion_tokens=n_diff,
+        device=device,
+    )
+
+
+def compute_clean_grads_vlm(
+    model: nn.Module,
+    targets: Dict[str, nn.Linear],
+    model_inputs: Dict,
+    gt_action: torch.Tensor,
+    t_val: float = 0.5,
+    noise: torch.Tensor | None = None,
+) -> Dict[str, torch.Tensor]:
+    """End-to-end VLM-grad pipeline. Builds a with-grad FMContext, runs one
+    FM one-step backward, snapshots fp32 grads for every target Linear, then
+    drops the with-grad context so its ~25-40 GB activation footprint is
+    GC'd before the bit-flip loop starts.
+
+    Returns the same dict shape as ``compute_clean_grads`` so downstream
+    ``topk_bitflip_coords`` works unchanged.
+    """
+    model.zero_grad(set_to_none=True)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        ctx_grad = build_fm_context_with_grad(model, model_inputs, gt_action)
+        loss = fm_one_step_loss(model, ctx_grad, t_val=t_val, noise=noise)
+    loss.backward()
+
+    grads: Dict[str, torch.Tensor] = {}
+    for name, mod in targets.items():
+        assert mod.weight.grad is not None, (
+            f"no grad reached {name}. Did checkpointing break the autograd graph? "
+            f"Check that build_fm_context_with_grad ran without @torch.no_grad."
+        )
+        grads[name] = mod.weight.grad.detach().clone().float()
+    model.zero_grad(set_to_none=True)
+    # Drop the with-grad context so its activation buffers free.
+    del ctx_grad
+    torch.cuda.empty_cache()
+    return grads
+
+
+def random_topk_coords(
+    weight: torch.Tensor,
+    bit: int,
+    k: int,
+    rng: int | np.random.Generator = 0,
+) -> Tuple[torch.LongTensor, torch.Tensor]:
+    """Random-coord baseline. Drop-in replacement for ``topk_bitflip_coords``
+    when gradients aren't available (Phase 3b).
+
+    Returns (flat_indices, NaN-filled values) — the NaN channel lets
+    downstream code distinguish ranked vs. random rows in the saved results.
+    The ``bit`` parameter is unused (signature parity with the gradient-guided
+    function); coords are sampled uniformly per call.
+    """
+    del bit  # signature parity only
+    g = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
+    n = weight.numel()
+    k_eff = min(k, n)
+    idx = torch.from_numpy(g.choice(n, size=k_eff, replace=False).astype(np.int64))
+    vals = torch.full((k_eff,), float("nan"), dtype=torch.float32)
+    return idx, vals
+
+
+@torch.no_grad()
+def measure_vlm_flipped_loss_reprefill(
+    model,
+    model_inputs: Dict,
+    gt_action: torch.Tensor,
+    module: nn.Linear,
+    flat_idx: int,
+    bit: int,
+    noise: torch.Tensor,
+    t_val: float = 0.5,
+) -> Dict[str, float]:
+    """Phase 3b per-trial measurement.
+
+    The cached K/V from a prior ``build_fm_context`` does NOT reflect a flip
+    on a VLM weight, so we rebuild the FMContext inside the trial. Cost
+    breakdown (single H20, S≈2000): ~600 ms VLM prefill + ~30 ms FM loss
+    ≈ 650 ms/trial — ~22× the cache-stable Phase 1 cost.
+
+    Mirrors ``measure_flipped_loss`` (line 326) for return-dict shape.
+    """
+    orig, flipped = bf16_flip_one(module.weight.data, flat_idx, bit)
+    try:
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            ctx = build_fm_context(model, model_inputs, gt_action)
+            loss = fm_one_step_loss(model, ctx, t_val=t_val, noise=noise).item()
+        is_finite = float(torch.isfinite(torch.tensor(loss)).item())
+    finally:
+        restore_one(module.weight.data, flat_idx, orig)
+    return {
+        "flat_idx": int(flat_idx),
+        "bit": int(bit),
+        "orig_value": float(orig.float().item()),
+        "flipped_value": float(flipped.float().item())
+            if torch.isfinite(flipped.float()) else float("nan"),
+        "post_loss": float(loss),
+        "post_loss_finite": is_finite,
+    }
+
+
+def cascade_top_n_to_rollout(
+    results_df: pd.DataFrame,
+    model,
+    model_inputs: Dict[str, Any],
+    gt_xy_traj: np.ndarray,
+    target_lookup: Dict[str, nn.Linear],
+    top_n: int = 50,
+    seed: int = 42,
+    rollout_kwargs: Dict[str, Any] | None = None,
+    name_col: str = "module",
+) -> pd.DataFrame:
+    """Replay top-N highest-Δloss WEIGHT flips through full-trajectory rollout.
+
+    For each row (sorted by ``post_loss`` desc, finite only):
+      1. ``bf16_flip_one(module.weight.data, flat_idx, bit)``
+      2. ``run_rollout(model, model_inputs, seed)``
+      3. ``compute_traj_metrics(pred_xy, gt_xy_traj)``
+      4. ``restore_one(...)`` in finally
+
+    Cache flips (Phase 2a) are filtered out: their FM-loss-via-cache attack
+    doesn't naturally compose with a closed-loop rollout that rebuilds cache
+    per inference. A cache-aware cascade would patch the inference loop and
+    is intentionally out of scope.
+
+    Args:
+        results_df: parquet/csv-loaded BFA results with at minimum columns
+            [name_col, flat_idx, bit, post_loss, post_loss_finite].
+        target_lookup: maps qualified module name -> nn.Linear. Build with
+            ``{name: model.get_submodule(name) for name in df[name_col].unique()}``.
+        gt_xy_traj: (T, 2) ground-truth waypoints in the same frame as
+            the rollout's pred_xyz output.
+        rollout_kwargs: forwarded to ``run_rollout`` (top_p, temperature,
+            num_traj_samples, ...).
+        name_col: column name holding the module qualified name. Existing
+            Phase 1 / 3a / 3b notebooks use ``"module"``; future schemas may
+            use ``"target_name"``.
+
+    Returns:
+        DataFrame with all original columns + [n_finite, minADE_m, meanADE_m,
+        minFDE_m, meanFDE_m] appended for cascaded rows. Skipped rows
+        (e.g. cache flips) are not included.
+    """
+    rollout_kwargs = rollout_kwargs or {}
+    finite = results_df[results_df["post_loss_finite"] == 1.0]
+    top = finite.nlargest(top_n, "post_loss")
+
+    out_rows: List[Dict[str, Any]] = []
+    for _, row in top.iterrows():
+        name = row[name_col]
+        target = target_lookup.get(name)
+        if not isinstance(target, nn.Linear):
+            continue  # cache flips deferred
+
+        flat_idx = int(row["flat_idx"])
+        bit = int(row["bit"])
+        orig, _ = bf16_flip_one(target.weight.data, flat_idx, bit)
+        try:
+            roll = run_rollout(model, model_inputs, seed=seed, **rollout_kwargs)
+            pred_xyz = roll["pred_xyz"].numpy()
+            # Squeeze leading batch dim if present: rollout may return (B,K,T,3)
+            # or (K,T,3) depending on whether the data was already batched.
+            if pred_xyz.ndim == 4:
+                pred_xyz = pred_xyz[0]
+            pred_xy = pred_xyz[..., :2]
+            metrics = compute_traj_metrics(pred_xy, gt_xy_traj)
+        finally:
+            restore_one(target.weight.data, flat_idx, orig)
+
+        merged = row.to_dict()
+        merged.update(metrics)
+        out_rows.append(merged)
+
+    return pd.DataFrame(out_rows)
