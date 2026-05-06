@@ -747,12 +747,29 @@ def compute_clean_grads_vlm(
     loss.backward()
 
     grads: Dict[str, torch.Tensor] = {}
+    unreached: List[str] = []
     for name, mod in targets.items():
-        assert mod.weight.grad is not None, (
-            f"no grad reached {name}. Did checkpointing break the autograd graph? "
-            f"Check that build_fm_context_with_grad ran without @torch.no_grad."
-        )
+        if mod.weight.grad is None:
+            unreached.append(name)
+            continue
         grads[name] = mod.weight.grad.detach().clone().float()
+    if unreached:
+        # Gradient enters the VLM only through the K/V cache (the only thing the
+        # action expert reads). Weights whose output doesn't reach a cache slot
+        # have None grad — most commonly the LAST decoder layer's
+        # mlp.{gate,up,down}_proj and self_attn.{q,o}_proj, since their outputs
+        # flow to model.norm → lm_head, which fm_one_step_loss never touches.
+        # First-order bit-flip impact is zero for these, so we drop them rather
+        # than waste trial budget; pair them with the random baseline instead.
+        # Caller should iterate `grads.keys()`, not `targets.keys()`.
+        import warnings
+        head = ", ".join(unreached[:5]) + (" …" if len(unreached) > 5 else "")
+        warnings.warn(
+            f"compute_clean_grads_vlm: {len(unreached)}/{len(targets)} target "
+            f"Linear(s) had no gradient (graph dead-ends w.r.t. the FM loss). "
+            f"Dropped from returned dict. Examples: {head}",
+            stacklevel=2,
+        )
     model.zero_grad(set_to_none=True)
     # Drop the with-grad context so its activation buffers free. empty_cache
     # is process-scoped but we wrap it in torch.cuda.device(dev) anyway so
