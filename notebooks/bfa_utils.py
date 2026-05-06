@@ -485,6 +485,7 @@ def measure_kv_flipped_loss(
 def run_rollout(
     model,
     model_inputs: Dict[str, Any],
+    device: torch.device | str | int,
     seed: int = 42,
     **roll_kwargs: Any,
 ) -> Dict[str, Any]:
@@ -495,12 +496,23 @@ def run_rollout(
     `top_p`, `temperature`, `num_traj_samples`, `max_generation_length`.
     `return_extra=True` is always set so CoT text is captured.
 
-    The CUDA seed is set inside this function so back-to-back calls are
-    independent of caller-side RNG state. bfloat16 autocast is used to
-    match the release model's inference dtype.
+    Args:
+        device: REQUIRED — GPU to scope the CUDA RNG seed to. On a shared
+            multi-GPU server, do not rely on `cuda` defaults; pass an
+            explicit device id or ``torch.device``. The autocast dtype is
+            derived from this device's type so ``cuda:N`` correctly selects
+            CUDA autocast policy.
+        seed: CUDA RNG seed for this rollout. Set inside the function so
+            back-to-back calls are independent of caller-side RNG state.
     """
-    torch.cuda.manual_seed_all(seed)
-    with torch.autocast("cuda", dtype=torch.bfloat16):
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    # Scope the seed to the chosen device only — manual_seed_all would touch
+    # every visible CUDA device, which we want to avoid on shared hardware.
+    with torch.cuda.device(dev):
+        torch.cuda.manual_seed(seed)
+    # autocast device_type ("cuda" / "cpu") is policy-only; the specific
+    # GPU is still determined by tensor placement on `dev`.
+    with torch.autocast(dev.type, dtype=torch.bfloat16):
         pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
             data=model_inputs,
             return_extra=True,
@@ -574,7 +586,7 @@ def compute_traj_metrics(
 
 def collect_target_linears_vlm(
     model: nn.Module,
-    include_prefixes: Tuple[str, ...] = ("vlm.model.layers.",),
+    include_prefixes: Tuple[str, ...] = ("vlm.model.language_model.layers.",),
 ) -> Dict[str, nn.Linear]:
     """Linear collector restricted to the VLM text decoder by default.
 
@@ -582,6 +594,11 @@ def collect_target_linears_vlm(
     those don't flow into action regression through the cached K/V.
     Pass a wider tuple to include them. ~36 layers × 7 linears ≈ 250
     modules for Qwen3-VL-8B.
+
+    Path note: in current HF transformers the Qwen3-VL text decoder lives at
+    ``vlm.model.language_model.layers.*`` (the outer ``Qwen3VLModel`` was
+    split into ``visual`` + ``language_model`` submodules). Older snapshots
+    used ``vlm.model.layers.*`` directly.
     """
     out: Dict[str, nn.Linear] = {}
     for name, mod in model.named_modules():
@@ -594,15 +611,18 @@ def collect_target_linears_vlm(
 
 @contextlib.contextmanager
 def _checkpoint_vlm_layers(model):
-    """Wrap each ``model.vlm.model.layers[i].forward`` in
+    """Wrap each ``model.vlm.model.language_model.layers[i].forward`` in
     ``torch.utils.checkpoint.checkpoint`` for the duration of the with-block.
 
     We monkey-patch the bound method on each layer instance instead of using
     HF's ``gradient_checkpointing_enable()`` because the latter is gated on
     ``self.training`` in some transformers versions, and we are in eval mode.
     Restored on exit even if the block raises.
+
+    Path note: see ``collect_target_linears_vlm`` for why this is
+    ``language_model.layers`` rather than just ``layers``.
     """
-    layers = model.vlm.model.layers
+    layers = model.vlm.model.language_model.layers
     originals: List[Callable] = []
     for layer in layers:
         orig = layer.forward
@@ -692,6 +712,7 @@ def compute_clean_grads_vlm(
     targets: Dict[str, nn.Linear],
     model_inputs: Dict,
     gt_action: torch.Tensor,
+    device: torch.device | str | int,
     t_val: float = 0.5,
     noise: torch.Tensor | None = None,
 ) -> Dict[str, torch.Tensor]:
@@ -700,11 +721,17 @@ def compute_clean_grads_vlm(
     drops the with-grad context so its ~25-40 GB activation footprint is
     GC'd before the bit-flip loop starts.
 
+    Args:
+        device: REQUIRED — GPU on which the autocast policy is selected and
+            ``empty_cache`` is scoped. Avoids relying on ``cuda`` defaults
+            on shared multi-GPU servers.
+
     Returns the same dict shape as ``compute_clean_grads`` so downstream
     ``topk_bitflip_coords`` works unchanged.
     """
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
     model.zero_grad(set_to_none=True)
-    with torch.autocast("cuda", dtype=torch.bfloat16):
+    with torch.autocast(dev.type, dtype=torch.bfloat16):
         ctx_grad = build_fm_context_with_grad(model, model_inputs, gt_action)
         loss = fm_one_step_loss(model, ctx_grad, t_val=t_val, noise=noise)
     loss.backward()
@@ -717,9 +744,12 @@ def compute_clean_grads_vlm(
         )
         grads[name] = mod.weight.grad.detach().clone().float()
     model.zero_grad(set_to_none=True)
-    # Drop the with-grad context so its activation buffers free.
+    # Drop the with-grad context so its activation buffers free. empty_cache
+    # is process-scoped but we wrap it in torch.cuda.device(dev) anyway so
+    # caller intent is explicit and visible in any future profiling.
     del ctx_grad
-    torch.cuda.empty_cache()
+    with torch.cuda.device(dev):
+        torch.cuda.empty_cache()
     return grads
 
 
@@ -755,6 +785,7 @@ def measure_vlm_flipped_loss_reprefill(
     flat_idx: int,
     bit: int,
     noise: torch.Tensor,
+    device: torch.device | str | int,
     t_val: float = 0.5,
 ) -> Dict[str, float]:
     """Phase 3b per-trial measurement.
@@ -764,11 +795,19 @@ def measure_vlm_flipped_loss_reprefill(
     breakdown (single H20, S≈2000): ~600 ms VLM prefill + ~30 ms FM loss
     ≈ 650 ms/trial — ~22× the cache-stable Phase 1 cost.
 
+    Args:
+        device: REQUIRED — autocast policy is selected from this device's
+            type. The actual GPU used is wherever ``model`` and
+            ``model_inputs`` already live; passing ``device`` ensures the
+            autocast device_type is consistent with that placement on shared
+            multi-GPU servers.
+
     Mirrors ``measure_flipped_loss`` (line 326) for return-dict shape.
     """
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
     orig, flipped = bf16_flip_one(module.weight.data, flat_idx, bit)
     try:
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast(dev.type, dtype=torch.bfloat16):
             ctx = build_fm_context(model, model_inputs, gt_action)
             loss = fm_one_step_loss(model, ctx, t_val=t_val, noise=noise).item()
         is_finite = float(torch.isfinite(torch.tensor(loss)).item())
@@ -791,6 +830,7 @@ def cascade_top_n_to_rollout(
     model_inputs: Dict[str, Any],
     gt_xy_traj: np.ndarray,
     target_lookup: Dict[str, nn.Linear],
+    device: torch.device | str | int,
     top_n: int = 50,
     seed: int = 42,
     rollout_kwargs: Dict[str, Any] | None = None,
@@ -816,6 +856,9 @@ def cascade_top_n_to_rollout(
             ``{name: model.get_submodule(name) for name in df[name_col].unique()}``.
         gt_xy_traj: (T, 2) ground-truth waypoints in the same frame as
             the rollout's pred_xyz output.
+        device: REQUIRED — forwarded to ``run_rollout`` so the per-flip
+            rollout's CUDA RNG seeding and autocast policy are scoped to
+            the user's allocated GPU rather than ``cuda:0``.
         rollout_kwargs: forwarded to ``run_rollout`` (top_p, temperature,
             num_traj_samples, ...).
         name_col: column name holding the module qualified name. Existing
@@ -842,7 +885,7 @@ def cascade_top_n_to_rollout(
         bit = int(row["bit"])
         orig, _ = bf16_flip_one(target.weight.data, flat_idx, bit)
         try:
-            roll = run_rollout(model, model_inputs, seed=seed, **rollout_kwargs)
+            roll = run_rollout(model, model_inputs, device=device, seed=seed, **rollout_kwargs)
             pred_xyz = roll["pred_xyz"].numpy()
             # Squeeze leading batch dim if present: rollout may return (B,K,T,3)
             # or (K,T,3) depending on whether the data was already batched.
