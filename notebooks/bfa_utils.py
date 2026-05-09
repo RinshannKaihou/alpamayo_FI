@@ -1221,3 +1221,67 @@ def capture_clean_cot_sequences(
         "cot_text": cot_text,
         "tokenized_data": tokenized,
     }
+
+
+def cot_perplexity_loss(
+    model,
+    full_sequences: torch.Tensor,
+    prefix_len: int,
+    tokenized_fused: Dict[str, Any],
+    device: torch.device | str | int,
+) -> torch.Tensor:
+    """Mean cross-entropy of the clean CoT under current VLM weights.
+
+    L = (1/S_cot) Σ_t [ -log p_w(c_t | c_<t, image, prompt) ]   for t in CoT
+
+    Teacher-forces the captured ``full_sequences`` through the VLM and
+    averages CE over the CoT positions. Differentiable w.r.t. VLM weights —
+    the caller is responsible for ``zero_grad`` and ``backward``.
+
+    Cheaper than ``fm_one_step_loss`` with re-prefill: one VLM forward, no
+    expert, no FMContext rebuild. ~600 ms on H20 at S≈2050.
+
+    Args:
+        full_sequences: (B, S_prefix + S_cot) long tensor — raw token IDs
+            from :func:`capture_clean_cot_sequences`.
+        prefix_len: where the CoT starts in ``full_sequences`` (inclusive).
+            Tokens at positions ``[prefix_len, ..., end]`` are scored.
+        tokenized_fused: must contain ``pixel_values``, ``image_grid_thw``;
+            ``attention_mask`` is rebuilt to all-ones over the full length
+            so the VLM attends across the whole prefix + CoT span (the
+            stored mask only covers the original prefix).
+
+    Returns:
+        scalar fp32 loss, differentiable when called outside ``no_grad``.
+    """
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    seq = full_sequences.to(dev)
+    B, S_total = seq.shape
+
+    # All-ones mask over full length: the captured sequences come from the
+    # model's own generate(), so every token is real (no padding to mask).
+    attn = torch.ones((B, S_total), device=dev, dtype=torch.long)
+
+    out = model.vlm(
+        input_ids=seq,
+        attention_mask=attn,
+        image_grid_thw=tokenized_fused.get("image_grid_thw"),
+        pixel_values=tokenized_fused.get("pixel_values"),
+        use_cache=False,
+        # Intentionally NOT passing logits_to_keep — we need full per-token
+        # logits across the CoT span. build_fm_context uses logits_to_keep=1
+        # because it only needs the last position's hidden state for the
+        # expert; here we want every CoT position scored.
+    )
+    logits = out.logits  # (B, S_total, V)
+
+    # Standard next-token CE shift: logits at position t-1 predict token t.
+    # Slicing [prefix_len-1 : -1] gives S_cot logit rows aligned with the
+    # S_cot target tokens at [prefix_len : ].
+    pred = logits[:, prefix_len - 1 : -1, :]                  # (B, S_cot, V)
+    target = seq[:, prefix_len:]                              # (B, S_cot)
+    return F.cross_entropy(
+        pred.reshape(-1, pred.size(-1)).float(),
+        target.reshape(-1),
+        reduction="mean",
+    )
