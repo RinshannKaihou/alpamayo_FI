@@ -1043,13 +1043,14 @@ def cascade_top_n_to_rollout(
     seed: int = 42,
     rollout_kwargs: Dict[str, Any] | None = None,
     name_col: str = "module",
+    reference_xy: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """Replay top-N highest-Δloss WEIGHT flips through full-trajectory rollout.
 
     For each row (sorted by ``post_loss`` desc, finite only):
       1. ``bf16_flip_one(module.weight.data, flat_idx, bit)``
       2. ``run_rollout(model, model_inputs, seed)``
-      3. ``compute_traj_metrics(pred_xy, gt_xy_traj)``
+      3. ``compute_traj_metrics(pred_xy, ref)``
       4. ``restore_one(...)`` in finally
 
     Cache flips (Phase 2a) are filtered out: their FM-loss-via-cache attack
@@ -1063,7 +1064,8 @@ def cascade_top_n_to_rollout(
         target_lookup: maps qualified module name -> nn.Linear. Build with
             ``{name: model.get_submodule(name) for name in df[name_col].unique()}``.
         gt_xy_traj: (T, 2) ground-truth waypoints in the same frame as
-            the rollout's pred_xyz output.
+            the rollout's pred_xyz output. Used as the metric reference when
+            ``reference_xy`` is None (the original "deviation from GT" mode).
         device: REQUIRED — forwarded to ``run_rollout`` so the per-flip
             rollout's CUDA RNG seeding and autocast policy are scoped to
             the user's allocated GPU rather than ``cuda:0``.
@@ -1072,6 +1074,12 @@ def cascade_top_n_to_rollout(
         name_col: column name holding the module qualified name. Existing
             Phase 1 / 3a / 3b notebooks use ``"module"``; future schemas may
             use ``"target_name"``.
+        reference_xy: optional (T, 2) reference trajectory used as the metric
+            anchor. When provided, ADE/FDE measure deviation from this clean
+            rollout instead of from ground truth — the safety-relevant
+            "deflection from nominal" metric for the SDC paper. Pass the
+            mean / a single-sample slice of the clean rollout for a stable
+            reference. Falls back to ``gt_xy_traj`` when None.
 
     Returns:
         DataFrame with all original columns + [n_finite, minADE_m, meanADE_m,
@@ -1100,7 +1108,8 @@ def cascade_top_n_to_rollout(
             if pred_xyz.ndim == 4:
                 pred_xyz = pred_xyz[0]
             pred_xy = pred_xyz[..., :2]
-            metrics = compute_traj_metrics(pred_xy, gt_xy_traj)
+            ref = reference_xy if reference_xy is not None else gt_xy_traj
+            metrics = compute_traj_metrics(pred_xy, ref)
         finally:
             restore_one(target.weight.data, flat_idx, orig)
 
