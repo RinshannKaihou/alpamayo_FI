@@ -1285,3 +1285,58 @@ def cot_perplexity_loss(
         target.reshape(-1),
         reduction="mean",
     )
+
+
+def compute_clean_grads_vlm_perp(
+    model: nn.Module,
+    targets: Dict[str, nn.Linear],
+    full_sequences: torch.Tensor,
+    prefix_len: int,
+    tokenized_fused: Dict[str, Any],
+    device: torch.device | str | int,
+    use_checkpoint: bool = True,
+) -> Dict[str, torch.Tensor]:
+    """Backward through ``cot_perplexity_loss``; snapshot per-target fp32 grads.
+
+    Mirrors :func:`compute_clean_grads_vlm` but the loss is CoT NLL instead
+    of FM-one-step. Uses :func:`_checkpoint_vlm_layers` so backward through
+    the 8B VLM × ~2050 tokens fits under ~80 GB on a 96 GB H20.
+
+    Drops modules whose grad came back ``None`` — typically the last
+    transformer layer's submodules whose outputs feed the lm_head's CE
+    directly (so they reach the loss; usually no dead-ends here, unlike
+    the FM-loss variant where the lm_head is bypassed).
+
+    Returns the same dict shape as :func:`compute_clean_grads_vlm` so
+    downstream :func:`topk_bitflip_coords` works unchanged.
+    """
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    model.zero_grad(set_to_none=True)
+
+    ckpt_ctx = _checkpoint_vlm_layers(model) if use_checkpoint else contextlib.nullcontext()
+    with ckpt_ctx, torch.autocast(dev.type, dtype=torch.bfloat16):
+        loss = cot_perplexity_loss(
+            model, full_sequences, prefix_len, tokenized_fused, device=dev
+        )
+    loss.backward()
+
+    grads: Dict[str, torch.Tensor] = {}
+    unreached: List[str] = []
+    for name, mod in targets.items():
+        if mod.weight.grad is None:
+            unreached.append(name)
+            continue
+        grads[name] = mod.weight.grad.detach().clone().float()
+    if unreached:
+        import warnings
+        head = ", ".join(unreached[:5]) + (" …" if len(unreached) > 5 else "")
+        warnings.warn(
+            f"compute_clean_grads_vlm_perp: {len(unreached)}/{len(targets)} target "
+            f"Linear(s) had no gradient (graph dead-ends w.r.t. CoT NLL). "
+            f"Dropped from returned dict. Examples: {head}",
+            stacklevel=2,
+        )
+    model.zero_grad(set_to_none=True)
+    with torch.cuda.device(dev):
+        torch.cuda.empty_cache()
+    return grads
