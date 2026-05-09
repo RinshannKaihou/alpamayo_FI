@@ -358,6 +358,67 @@ def differentiable_rollout(
     return x
 
 
+def proj_target_loss(
+    model,
+    ctx: FMContext,
+    fixed_noise: torch.Tensor,
+    u: torch.Tensor,
+    history_xyz_last: torch.Tensor,
+    history_rot_last: torch.Tensor,
+    n_ode_steps: int = 4,
+) -> torch.Tensor:
+    """Scalar linear projection of the rolled-out trajectory.
+
+    L = (u * pred_xy.float()).sum()
+
+    pred_xy = action_to_traj(differentiable_rollout(...))[..., :2]
+
+    Args:
+        u: tensor broadcastable to pred_xy shape (B, n_wp, 2). For Hutchinson
+            ranking, draw n_probe random unit vectors and call this fn n_probe
+            times, averaging squared bit-grads downstream.
+        history_xyz_last: (B, T_hist, 3). Pre-sliced last-step history.
+            Mirror the pattern at src/alpamayo1_5/models/alpamayo1_5.py:373-378:
+            `model_inputs["ego_history_xyz"][:, -1]` (no einops.repeat needed
+            since we use B=1, n_samples_total=1 in the BFA setup).
+        history_rot_last: (B, T_hist, 3, 3). Pre-sliced last-step rotation.
+    """
+    final_action = differentiable_rollout(model, ctx, fixed_noise, n_ode_steps=n_ode_steps)
+    pred_xyz, _pred_rot = model.action_space.action_to_traj(
+        final_action, history_xyz_last, history_rot_last
+    )
+    pred_xy = pred_xyz[..., :2]
+    return (u.to(pred_xy.dtype) * pred_xy).float().sum()
+
+
+def compute_clean_grads_proj(
+    model: nn.Module,
+    targets: Dict[str, nn.Linear],
+    ctx: FMContext,
+    fixed_noise: torch.Tensor,
+    u: torch.Tensor,
+    history_xyz_last: torch.Tensor,
+    history_rot_last: torch.Tensor,
+    n_ode_steps: int = 4,
+) -> Dict[str, torch.Tensor]:
+    """Backward through proj_target_loss, snapshot per-target fp32 grads.
+
+    Drop-in shape-compatible with compute_clean_grads (bfa_utils.py:287),
+    so downstream topk_bitflip_coords works unchanged.
+    """
+    model.zero_grad(set_to_none=True)
+    loss = proj_target_loss(
+        model, ctx, fixed_noise, u, history_xyz_last, history_rot_last, n_ode_steps=n_ode_steps
+    )
+    loss.backward()
+    grads: Dict[str, torch.Tensor] = {}
+    for name, mod in targets.items():
+        assert mod.weight.grad is not None, f"no grad reached {name}"
+        grads[name] = mod.weight.grad.detach().clone().float()
+    model.zero_grad(set_to_none=True)
+    return grads
+
+
 def compute_clean_grads(
     model: nn.Module,
     targets: Dict[str, nn.Linear],
