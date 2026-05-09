@@ -1118,3 +1118,106 @@ def cascade_top_n_to_rollout(
         out_rows.append(merged)
 
     return pd.DataFrame(out_rows)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3a-perp: CoT-perplexity ranker for VLM weights
+# --------------------------------------------------------------------------- #
+#
+# Same gradient-ranking machinery as Phase 3a, but the scalar loss is the
+# cross-entropy of the clean model's CoT under (potentially flipped) VLM
+# weights — a standard NLP eval, naturally baseline-anchored, and cheaper
+# per-trial than fm_one_step_loss-with-reprefill (no expert involvement).
+
+
+@torch.no_grad()
+def capture_clean_cot_sequences(
+    model,
+    model_inputs: Dict[str, Any],
+    device: torch.device | str | int,
+    seed: int = 42,
+    **roll_kwargs: Any,
+) -> Dict[str, Any]:
+    """One clean rollout, return raw token IDs + the prefix length.
+
+    Differs from :func:`run_rollout` in that we don't extract text — we keep
+    the integer token IDs needed for teacher-forcing the (potentially flipped)
+    VLM through cross-entropy. We also don't run the expert / decode actions:
+    only the VLM half of the rollout matters for CoT perplexity.
+
+    The generation setup mirrors ``Alpamayo1_5.sample_trajectories_from_data_
+    with_vlm_rollout`` (top_p=0.98, temp=0.6, do_sample=True by default) so
+    the captured CoT matches the deployed inference distribution.
+
+    Args:
+        device: REQUIRED — GPU to scope the CUDA RNG seed and autocast policy
+            to. Don't rely on cuda:0 defaults on shared multi-GPU servers.
+        seed: CUDA RNG seed for reproducible CoT capture.
+        roll_kwargs: optional overrides — ``max_generation_length``, ``top_p``,
+            ``temperature``, ``do_sample``, ``num_traj_samples``.
+
+    Returns:
+        dict with:
+          - ``full_sequences``: (B*num_traj_samples, S_prefix + S_cot) long
+            tensor of token IDs, on CPU.
+          - ``prefix_len``: int, number of tokens in input_ids after
+            ``fuse_traj_tokens`` (where the CoT starts).
+          - ``cot_text``: str, decoded CoT for sanity / logging.
+          - ``tokenized_data``: dict with the post-fuse-traj-tokens
+            ``input_ids`` plus the original ``attention_mask``,
+            ``pixel_values``, ``image_grid_thw`` — to be replayed verbatim
+            on every per-trial VLM forward so position IDs reconstruct
+            identically.
+    """
+    from transformers import StoppingCriteriaList
+    from alpamayo1_5.models.token_utils import StopAfterEOS, to_special_token
+
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    tokenized = dict(model_inputs["tokenized_data"])
+    input_ids = tokenized["input_ids"]
+    input_ids = model.fuse_traj_tokens(
+        input_ids,
+        {
+            "ego_history_xyz": model_inputs["ego_history_xyz"],
+            "ego_history_rot": model_inputs["ego_history_rot"],
+        },
+    )
+    prefix_len = int(input_ids.shape[-1])
+    tokenized["input_ids"] = input_ids
+
+    max_gen = roll_kwargs.get("max_generation_length", model.config.tokens_per_future_traj)
+    gen_cfg = model.vlm.generation_config
+    gen_cfg.top_p = roll_kwargs.get("top_p", 0.98)
+    gen_cfg.temperature = roll_kwargs.get("temperature", 0.6)
+    gen_cfg.do_sample = roll_kwargs.get("do_sample", True)
+    gen_cfg.num_return_sequences = roll_kwargs.get("num_traj_samples", 1)
+    gen_cfg.max_new_tokens = max_gen
+    gen_cfg.output_logits = False
+    gen_cfg.return_dict_in_generate = True
+    gen_cfg.pad_token_id = model.tokenizer.pad_token_id
+
+    eos_id = model.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
+    stopping = StoppingCriteriaList([StopAfterEOS(eos_token_id=eos_id)])
+
+    with torch.cuda.device(dev):
+        torch.cuda.manual_seed(seed)
+    with torch.autocast(dev.type, dtype=torch.bfloat16):
+        out = model.vlm.generate(
+            input_ids=input_ids,
+            generation_config=gen_cfg,
+            stopping_criteria=stopping,
+            attention_mask=tokenized.get("attention_mask"),
+            image_grid_thw=tokenized.get("image_grid_thw"),
+            pixel_values=tokenized.get("pixel_values"),
+        )
+
+    full_sequences = out.sequences.detach().cpu()
+    cot_text = model.tokenizer.decode(
+        full_sequences[0, prefix_len:], skip_special_tokens=False
+    )
+    return {
+        "full_sequences": full_sequences,
+        "prefix_len": prefix_len,
+        "cot_text": cot_text,
+        "tokenized_data": tokenized,
+    }
