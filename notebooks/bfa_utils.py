@@ -284,6 +284,80 @@ def fm_one_step_loss(
         ctx.prompt_cache.crop(ctx.prefill_seq_len)
 
 
+def differentiable_rollout(
+    model,
+    ctx: FMContext,
+    fixed_noise: torch.Tensor,
+    n_ode_steps: int = 4,
+) -> torch.Tensor:
+    """Differentiable multi-step Euler rollout reusing a pre-built FMContext.
+
+    Mirrors the Euler loop in src/alpamayo1_5/diffusion/flow_matching.py:171-196
+    but (a) does NOT use @torch.no_grad, (b) reuses ctx.prompt_cache instead
+    of re-running the VLM, (c) takes fixed_noise so the rollout is a smooth
+    deterministic function of weights.
+
+    Args:
+        ctx: from build_fm_context (no-grad version is fine; we only backprop
+            through the expert + action projections, not the VLM).
+        fixed_noise: (B, n_waypoints, action_dim) bf16 tensor — same shape as
+            ctx.gt_action. Held constant across (clean, flipped) trials.
+        n_ode_steps: number of Euler steps. Inference default is 10; 4 is a
+            speed/fidelity tradeoff for the BFA gradient computation.
+
+    Returns:
+        Final action state (B, n_waypoints, action_dim), bf16. Decode with
+        model.action_space.action_to_traj to get xyz waypoints.
+
+    Cache discipline: each step does
+        expert(... past_key_values=ctx.prompt_cache, use_cache=True)
+        ctx.prompt_cache.crop(ctx.prefill_seq_len)
+    so the cache is restored to prefix length after each step. The autograd
+    graph keeps the saved K/V tensors alive even after crop drops the Python
+    refs. Wrapped in try/finally so an exception still leaves the cache safe.
+    """
+    x = fixed_noise
+    device = ctx.device
+    n_diff = ctx.n_diffusion_tokens
+    b_star = x.shape[0]
+    time_steps = torch.linspace(0.0, 1.0, n_ode_steps + 1, device=device)
+
+    forward_kwargs = {}
+    if model.config.expert_non_causal_attention:
+        forward_kwargs["is_causal"] = False
+
+    try:
+        for i in range(n_ode_steps):
+            dt = time_steps[i + 1] - time_steps[i]
+            t_start = time_steps[i].view(1, *([1] * (x.ndim - 1))).expand(
+                b_star, *([1] * (x.ndim - 1))
+            ).to(x.dtype)
+
+            future_token_embeds = model.action_in_proj(x, t_start)
+            if future_token_embeds.dim() == 2:
+                future_token_embeds = future_token_embeds.view(b_star, n_diff, -1)
+
+            expert_out = model.expert(
+                inputs_embeds=future_token_embeds,
+                position_ids=ctx.position_ids,
+                past_key_values=ctx.prompt_cache,
+                attention_mask=ctx.attention_mask,
+                use_cache=True,
+                **forward_kwargs,
+            )
+            ctx.prompt_cache.crop(ctx.prefill_seq_len)
+
+            last_hidden = expert_out.last_hidden_state[:, -n_diff:]
+            v = model.action_out_proj(last_hidden).view_as(x)
+            x = x + dt.to(x.dtype) * v
+    finally:
+        # Defensive: ensure cache length is the prefix length on exit even on error.
+        if ctx.prompt_cache.get_seq_length() != ctx.prefill_seq_len:
+            ctx.prompt_cache.crop(ctx.prefill_seq_len)
+
+    return x
+
+
 def compute_clean_grads(
     model: nn.Module,
     targets: Dict[str, nn.Linear],
