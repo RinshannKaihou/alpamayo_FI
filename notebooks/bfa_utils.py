@@ -1340,3 +1340,45 @@ def compute_clean_grads_vlm_perp(
     with torch.cuda.device(dev):
         torch.cuda.empty_cache()
     return grads
+
+
+@torch.no_grad()
+def measure_vlm_flipped_loss_perp(
+    model,
+    full_sequences: torch.Tensor,
+    prefix_len: int,
+    tokenized_fused: Dict[str, Any],
+    module: nn.Linear,
+    flat_idx: int,
+    bit: int,
+    device: torch.device | str | int,
+) -> Dict[str, float]:
+    """Phase 3a-perp per-trial measurement.
+
+    Cheaper than :func:`measure_vlm_flipped_loss_reprefill` (~600 ms forward
+    only, no FMContext rebuild, no expert). Mirrors that function's
+    return-dict shape so the existing pandas / parquet pipeline is unchanged.
+
+    Args:
+        device: REQUIRED — autocast policy is selected from this device's
+            type. The actual GPU is wherever ``model`` lives.
+    """
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    orig, flipped = bf16_flip_one(module.weight.data, flat_idx, bit)
+    try:
+        with torch.autocast(dev.type, dtype=torch.bfloat16):
+            loss = cot_perplexity_loss(
+                model, full_sequences, prefix_len, tokenized_fused, device=dev
+            ).item()
+        is_finite = float(torch.isfinite(torch.tensor(loss)).item())
+    finally:
+        restore_one(module.weight.data, flat_idx, orig)
+    return {
+        "flat_idx": int(flat_idx),
+        "bit": int(bit),
+        "orig_value": float(orig.float().item()),
+        "flipped_value": float(flipped.float().item())
+            if torch.isfinite(flipped.float()) else float("nan"),
+        "post_loss": float(loss),
+        "post_loss_finite": is_finite,
+    }
