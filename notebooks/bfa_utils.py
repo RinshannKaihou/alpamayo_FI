@@ -492,6 +492,52 @@ def measure_flipped_loss(
     }
 
 
+@torch.no_grad()
+def output_deflection_norm(
+    model,
+    ctx: FMContext,
+    pred_v_clean: torch.Tensor,
+    t_val: float = 0.5,
+    noise: torch.Tensor | None = None,
+) -> float:
+    """L2 norm of pred_v difference vs a precomputed clean reference.
+
+    Reuses the same forward path as fm_one_step_loss but returns
+    ‖pred_v_current − pred_v_clean‖ instead of MSE-against-gt. Use
+    inside measure_*_flipped_loss to log a baseline-deflection column.
+
+    pred_v_clean: snapshot from a clean run with the same fixed (t_val, noise).
+    """
+    gt = ctx.gt_action
+    if noise is None:
+        noise = torch.randn_like(gt)
+    t = torch.full((gt.shape[0], *[1] * (gt.ndim - 1)), t_val, device=gt.device, dtype=gt.dtype)
+    x_t = (1.0 - t) * noise + t * gt
+
+    future_token_embeds = model.action_in_proj(x_t, t)
+    if future_token_embeds.dim() == 2:
+        future_token_embeds = future_token_embeds.view(gt.shape[0], ctx.n_diffusion_tokens, -1)
+
+    forward_kwargs = {}
+    if model.config.expert_non_causal_attention:
+        forward_kwargs["is_causal"] = False
+
+    expert_out = model.expert(
+        inputs_embeds=future_token_embeds,
+        position_ids=ctx.position_ids,
+        past_key_values=ctx.prompt_cache,
+        attention_mask=ctx.attention_mask,
+        use_cache=True,
+        **forward_kwargs,
+    )
+    try:
+        last_hidden = expert_out.last_hidden_state[:, -ctx.n_diffusion_tokens:]
+        pred_v = model.action_out_proj(last_hidden).view_as(gt)
+        return (pred_v.float() - pred_v_clean.float()).norm().item()
+    finally:
+        ctx.prompt_cache.crop(ctx.prefill_seq_len)
+
+
 # --------------------------------------------------------------------------- #
 # Phase 2a: KV-cache fault injection
 # --------------------------------------------------------------------------- #
