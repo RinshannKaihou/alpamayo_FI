@@ -326,30 +326,37 @@ def differentiable_rollout(
     if model.config.expert_non_causal_attention:
         forward_kwargs["is_causal"] = False
 
+    # Match the autocast envelope used to build ctx.prompt_cache (see
+    # bfa_demo.ipynb / bfa_kv_demo.ipynb). Without it, some expert norms
+    # (k_norm in particular) produce fp32 K while V stays bf16, and the
+    # cache.update cat([bf16, fp32]) auto-promotes K to fp32 — SDPA then
+    # raises "query/key/value dtype mismatch". autocast composes with the
+    # outer torch.no_grad / loss.backward() callers.
     try:
-        for i in range(n_ode_steps):
-            dt = time_steps[i + 1] - time_steps[i]
-            t_start = time_steps[i].view(1, *([1] * (x.ndim - 1))).expand(
-                b_star, *([1] * (x.ndim - 1))
-            ).to(x.dtype)
+        with torch.autocast(device.type, dtype=torch.bfloat16):
+            for i in range(n_ode_steps):
+                dt = time_steps[i + 1] - time_steps[i]
+                t_start = time_steps[i].view(1, *([1] * (x.ndim - 1))).expand(
+                    b_star, *([1] * (x.ndim - 1))
+                ).to(x.dtype)
 
-            future_token_embeds = model.action_in_proj(x, t_start)
-            if future_token_embeds.dim() == 2:
-                future_token_embeds = future_token_embeds.view(b_star, n_diff, -1)
+                future_token_embeds = model.action_in_proj(x, t_start)
+                if future_token_embeds.dim() == 2:
+                    future_token_embeds = future_token_embeds.view(b_star, n_diff, -1)
 
-            expert_out = model.expert(
-                inputs_embeds=future_token_embeds,
-                position_ids=ctx.position_ids,
-                past_key_values=ctx.prompt_cache,
-                attention_mask=ctx.attention_mask,
-                use_cache=True,
-                **forward_kwargs,
-            )
-            ctx.prompt_cache.crop(ctx.prefill_seq_len)
+                expert_out = model.expert(
+                    inputs_embeds=future_token_embeds,
+                    position_ids=ctx.position_ids,
+                    past_key_values=ctx.prompt_cache,
+                    attention_mask=ctx.attention_mask,
+                    use_cache=True,
+                    **forward_kwargs,
+                )
+                ctx.prompt_cache.crop(ctx.prefill_seq_len)
 
-            last_hidden = expert_out.last_hidden_state[:, -n_diff:]
-            v = model.action_out_proj(last_hidden).view_as(x)
-            x = x + dt.to(x.dtype) * v
+                last_hidden = expert_out.last_hidden_state[:, -n_diff:]
+                v = model.action_out_proj(last_hidden).view_as(x)
+                x = x + dt.to(x.dtype) * v
     finally:
         # Defensive: ensure cache length is the prefix length on exit even on error.
         if ctx.prompt_cache.get_seq_length() != ctx.prefill_seq_len:
