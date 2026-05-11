@@ -447,15 +447,27 @@ def topk_bitflip_coords(
     grad_fp32: torch.Tensor,
     bit: int,
     k: int,
+    magnitude_only: bool = False,
 ) -> Tuple[torch.LongTensor, torch.Tensor]:
     """Return (flat_indices, bit_grad_values) for top-k LOSS-INCREASING
     coordinates at this bit position.
 
     Top-k is taken over `bit_grad_per_bit` descending — i.e., the
     coordinates where flipping `bit` is most predicted to raise loss.
+
+    Args:
+        magnitude_only: when True, rank by ``|bit_grad_per_bit|`` instead of
+            the signed value. Use for rankers whose gradient signal is
+            direction-agnostic — e.g. the Hutchinson-averaged RMS gradient
+            from :func:`compute_clean_grads_proj`, which is always >= 0 and
+            would otherwise reduce the ranking to "coords where bit-flip
+            increases the bf16 value" (half the search space). For the
+            signed FM-loss path (default), keep False.
     """
     bg = bit_grad_per_bit(weight_bf16, grad_fp32, bit)
     flat = bg.reshape(-1)
+    if magnitude_only:
+        flat = flat.abs()
     k_eff = min(k, flat.numel())
     vals, idx = torch.topk(flat, k=k_eff, largest=True)
     return idx.cpu(), vals.cpu()
@@ -1103,9 +1115,13 @@ def cascade_top_n_to_rollout(
         try:
             roll = run_rollout(model, model_inputs, device=device, seed=seed, **rollout_kwargs)
             pred_xyz = roll["pred_xyz"].numpy()
-            # Squeeze leading batch dim if present: rollout may return (B,K,T,3)
-            # or (K,T,3) depending on whether the data was already batched.
-            if pred_xyz.ndim == 4:
+            # sample_trajectories_from_data_with_vlm_rollout returns 5-D
+            # (B, num_traj_sets, num_traj_samples, T, 3) after
+            # einops.rearrange (src/alpamayo1_5/models/alpamayo1_5.py:385).
+            # Squeeze leading singleton dims down to (K, T, 3) so
+            # compute_traj_metrics's (K, T, 2)-vs-(T, 2) contract holds.
+            # Backward compatible: 4-D input squeezes once, 3-D passes through.
+            while pred_xyz.ndim > 3:
                 pred_xyz = pred_xyz[0]
             pred_xy = pred_xyz[..., :2]
             ref = reference_xy if reference_xy is not None else gt_xy_traj
