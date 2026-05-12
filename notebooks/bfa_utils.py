@@ -260,6 +260,12 @@ def fm_one_step_loss(
     if model.config.expert_non_causal_attention:
         forward_kwargs["is_causal"] = False
 
+    # Defensive crop: absorb stale extension from a prior call whose
+    # model.expert raised before reaching its own crop (cache.update mutates
+    # before SDPA, so partial layer updates leak when SDPA errors).
+    if ctx.prompt_cache.get_seq_length() != ctx.prefill_seq_len:
+        ctx.prompt_cache.crop(ctx.prefill_seq_len)
+
     # Self-wrap in autocast: see differentiable_rollout for the full rationale.
     # Without it, the expert k_norm path can produce fp32 K against a bf16
     # cached K, and SDPA raises a dtype-mismatch error. Callers that already
@@ -272,20 +278,21 @@ def fm_one_step_loss(
                 gt.shape[0], ctx.n_diffusion_tokens, -1
             )
 
-        expert_out = model.expert(
-            inputs_embeds=future_token_embeds,
-            position_ids=ctx.position_ids,
-            past_key_values=ctx.prompt_cache,
-            attention_mask=ctx.attention_mask,
-            use_cache=True,
-            **forward_kwargs,
-        )
         try:
+            expert_out = model.expert(
+                inputs_embeds=future_token_embeds,
+                position_ids=ctx.position_ids,
+                past_key_values=ctx.prompt_cache,
+                attention_mask=ctx.attention_mask,
+                use_cache=True,
+                **forward_kwargs,
+            )
             last_hidden = expert_out.last_hidden_state[:, -ctx.n_diffusion_tokens:]
             pred_v = model.action_out_proj(last_hidden).view_as(target_v)
             return F.mse_loss(pred_v.float(), target_v.float())
         finally:
-            # Always crop — even on exception — so ctx is safe for the next trial.
+            # Always crop — even on exception in model.expert — so ctx is
+            # safe for the next trial.
             ctx.prompt_cache.crop(ctx.prefill_seq_len)
 
 
@@ -563,22 +570,25 @@ def output_deflection_norm(
     if model.config.expert_non_causal_attention:
         forward_kwargs["is_causal"] = False
 
-    # Self-wrap in autocast — see differentiable_rollout / fm_one_step_loss
-    # for the dtype-mismatch rationale.
+    # Defensive crop + try/finally around model.expert: see fm_one_step_loss
+    # for the rationale (cache.update leaks on inner SDPA error).
+    if ctx.prompt_cache.get_seq_length() != ctx.prefill_seq_len:
+        ctx.prompt_cache.crop(ctx.prefill_seq_len)
+
     with torch.autocast(ctx.device.type, dtype=torch.bfloat16):
         future_token_embeds = model.action_in_proj(x_t, t)
         if future_token_embeds.dim() == 2:
             future_token_embeds = future_token_embeds.view(gt.shape[0], ctx.n_diffusion_tokens, -1)
 
-        expert_out = model.expert(
-            inputs_embeds=future_token_embeds,
-            position_ids=ctx.position_ids,
-            past_key_values=ctx.prompt_cache,
-            attention_mask=ctx.attention_mask,
-            use_cache=True,
-            **forward_kwargs,
-        )
         try:
+            expert_out = model.expert(
+                inputs_embeds=future_token_embeds,
+                position_ids=ctx.position_ids,
+                past_key_values=ctx.prompt_cache,
+                attention_mask=ctx.attention_mask,
+                use_cache=True,
+                **forward_kwargs,
+            )
             last_hidden = expert_out.last_hidden_state[:, -ctx.n_diffusion_tokens:]
             pred_v = model.action_out_proj(last_hidden).view_as(gt)
             return (pred_v.float() - pred_v_clean.float()).norm().item()
