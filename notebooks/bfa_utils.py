@@ -326,6 +326,16 @@ def differentiable_rollout(
     if model.config.expert_non_causal_attention:
         forward_kwargs["is_causal"] = False
 
+    # Detach cache entries from any prior rollout's autograd graph. After a
+    # previous loss.backward(), key_cache[l] / value_cache[l] are the slices
+    # left by crop() and still carry a SliceBackward → freed CatBackward
+    # grad_fn. Re-using them via cache.update cat()s a fresh tensor whose
+    # graph reaches into freed saved-tensors → "backward through the graph
+    # a second time" on the next backward. Detach shares storage, so this
+    # is a no-op for fresh ctx and a graph-sever for re-used ctx.
+    ctx.prompt_cache.key_cache = [t.detach() for t in ctx.prompt_cache.key_cache]
+    ctx.prompt_cache.value_cache = [t.detach() for t in ctx.prompt_cache.value_cache]
+
     # Match the autocast envelope used to build ctx.prompt_cache (see
     # bfa_demo.ipynb / bfa_kv_demo.ipynb). Without it, some expert norms
     # (k_norm in particular) produce fp32 K while V stays bf16, and the
