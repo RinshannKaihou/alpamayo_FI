@@ -327,14 +327,25 @@ def differentiable_rollout(
         forward_kwargs["is_causal"] = False
 
     # Detach cache entries from any prior rollout's autograd graph. After a
-    # previous loss.backward(), key_cache[l] / value_cache[l] are the slices
-    # left by crop() and still carry a SliceBackward → freed CatBackward
-    # grad_fn. Re-using them via cache.update cat()s a fresh tensor whose
-    # graph reaches into freed saved-tensors → "backward through the graph
-    # a second time" on the next backward. Detach shares storage, so this
-    # is a no-op for fresh ctx and a graph-sever for re-used ctx.
-    ctx.prompt_cache.key_cache = [t.detach() for t in ctx.prompt_cache.key_cache]
-    ctx.prompt_cache.value_cache = [t.detach() for t in ctx.prompt_cache.value_cache]
+    # previous loss.backward(), the slices left by crop() still carry a
+    # SliceBackward → freed CatBackward grad_fn; re-using them via
+    # cache.update cat()s a fresh tensor whose graph reaches freed saved-
+    # tensors → "backward through the graph a second time" on the next
+    # backward. Detach shares storage, so this is a no-op for fresh ctx
+    # and a graph-sever for re-used ctx.
+    # API note: transformers >=4.55-ish exposes K/V via cache.layers[l].keys
+    # / .values; older versions kept cache.key_cache[l] / value_cache[l]
+    # lists. Handle both since this codebase still targets the older API in
+    # the Phase 2a helpers below.
+    if hasattr(ctx.prompt_cache, "layers"):
+        for layer in ctx.prompt_cache.layers:
+            if layer.keys is not None:
+                layer.keys = layer.keys.detach()
+            if layer.values is not None:
+                layer.values = layer.values.detach()
+    else:
+        ctx.prompt_cache.key_cache = [t.detach() for t in ctx.prompt_cache.key_cache]
+        ctx.prompt_cache.value_cache = [t.detach() for t in ctx.prompt_cache.value_cache]
 
     # Match the autocast envelope used to build ctx.prompt_cache (see
     # bfa_demo.ipynb / bfa_kv_demo.ipynb). Without it, some expert norms
